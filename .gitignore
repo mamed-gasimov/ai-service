@@ -1,0 +1,10 @@
+.env
+/bin/
+/tmp/
+*.exe
+*.test
+*.out
+.idea
+.DS_Store
+pg_data/
+minio_data/
