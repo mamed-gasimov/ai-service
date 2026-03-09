@@ -13,7 +13,7 @@ ai-service/
 │   ├── config/config.go                         # .env → Config struct (caarlos0/env)
 │   ├── messaging/
 │   │   ├── messaging.go                         # Publisher/Consumer interfaces
-│   │   └── rabbitmq/rabbitmq.go                 # RabbitMQ client (publish + consume)
+│   │   └── rabbitmq/rabbitmq.go                 # RabbitMQ client (auto-reconnect, DLX setup)
 │   ├── modules/
 │   │   └── translation/
 │   │       ├── provider.go                      # Translator interface
@@ -57,10 +57,15 @@ The worker starts consuming from the `file.analyze` queue immediately. A health 
         ↓
   Publish AnalysisReply → [file.analysis.result queue]
         ↓
+  ACK the original message (only after successful publish)
+        ↓
   [file-service consumes and updates PostgreSQL]
 ```
 
-The worker loop reconnects automatically if the RabbitMQ channel closes, with a 5-second backoff. Each message is acknowledged only after a successful reply is published.
+### Processing guarantees
+
+- Messages are ACKed **only after** the reply is successfully published to `file.analysis.result`. If any step fails (download, OpenAI, marshal, publish), the message is NACKed to the dead-letter queue.
+- The worker loop reconnects automatically if the RabbitMQ channel closes, with a 5-second backoff.
 
 ## Configuration
 
@@ -83,6 +88,32 @@ All settings are loaded from environment variables (or an `.env` file via godote
 | Method | Endpoint | Description |
 |---|---|---|
 | `GET` | `/health` | Returns `{"status":"ok"}` — used by orchestrators |
+
+## Connection recovery
+
+The RabbitMQ client automatically reconnects with exponential backoff (1s → 30s) when the connection drops. The connection and channel are protected by a `sync.RWMutex` so publishers and consumers are thread-safe during reconnection. After reconnecting, all exchanges and queues are re-declared.
+
+The worker's outer `Run()` loop also handles channel-level closures: when the delivery channel closes, it re-calls `Consume()` to re-subscribe.
+
+## Dead Letter Exchange (DLX)
+
+Both services declare identical queue topology:
+
+```
+file.analyze  ──(nack)──▶  dlx exchange  ──▶  file.analyze.dlq
+file.analysis.result  ──(nack)──▶  dlx exchange  ──▶  file.analysis.result.dlq
+```
+
+- Exchange: `dlx` (type: `direct`, durable)
+- DLQ routing keys match DLQ names (e.g., `file.analyze.dlq`)
+- Main queues set `x-dead-letter-exchange` and `x-dead-letter-routing-key` arguments
+
+Messages land in DLQs when:
+- Unmarshal fails (malformed JSON)
+- MinIO download or OpenAI API call fails
+- Reply publish to `file.analysis.result` fails
+
+Use the RabbitMQ Management UI at `http://localhost:15672` to inspect accumulated messages.
 
 ## RabbitMQ message contracts
 
@@ -110,132 +141,12 @@ Both queues are declared `durable` with `persistent` delivery mode.
 }
 ```
 
-If processing fails, `translation_summary` is empty and `error` contains the failure message. file-service logs the error and skips the database update.
-
 ## OpenAI integration
 
 - **Model**: `gpt-4o-mini`
 - **Task**: Translation + summarization — any language → English, 2–3 sentences
 - **Input limit**: 100 000 bytes (content is truncated before sending)
 - **System prompt**: instructs the model to respond only in English with a concise summary and no preamble
-
-## Dead Letter Exchange (DLX) / Dead Letter Queue (DLQ)
-
-### Current state
-
-Neither this service nor file-service currently implement DLX/DLQ. Failed messages are acknowledged and dropped:
-
-- Unmarshal error → message lost
-- MinIO download failure → error published to reply queue, original message ACKed
-- OpenAI API failure → same as above
-
-### Why DLX/DLQ matters
-
-Without dead-letter routing, transient failures (network blip, OpenAI rate limit, MinIO timeout) permanently lose work. A DLX/DLQ setup captures failed messages for inspection and retry.
-
-### Implementation guide
-
-The approach requires changes in both services since they share the same queue declarations. Whichever service declares a queue first must include the DLX arguments.
-
-#### Step 1 — Declare the dead letter exchange and queue
-
-In `internal/messaging/rabbitmq/rabbitmq.go` of **both** services, replace the current plain queue declarations with:
-
-```go
-// 1. Declare the DLX (a durable direct exchange)
-if err := ch.ExchangeDeclare(
-    "dlx",    // name
-    "direct", // type
-    true,     // durable
-    false,    // auto-delete
-    false,    // internal
-    false,    // no-wait
-    nil,
-); err != nil {
-    return nil, fmt.Errorf("declare dlx: %w", err)
-}
-
-// 2. Declare dead letter queues (one per main queue)
-for _, dlq := range []string{"file.analyze.dlq", "file.analysis.result.dlq"} {
-    if _, err := ch.QueueDeclare(dlq, true, false, false, false, nil); err != nil {
-        return nil, fmt.Errorf("declare dlq %s: %w", dlq, err)
-    }
-    if err := ch.QueueBind(dlq, dlq, "dlx", false, nil); err != nil {
-        return nil, fmt.Errorf("bind dlq %s: %w", dlq, err)
-    }
-}
-
-// 3. Declare main queues with DLX and TTL arguments
-dlxArgs := amqp.Table{
-    "x-dead-letter-exchange":     "dlx",
-    "x-dead-letter-routing-key":  "",   // set per queue below
-    "x-message-ttl":              86_400_000, // 24 h in ms
-}
-for _, q := range []string{"file.analyze", "file.analysis.result"} {
-    args := amqp.Table{
-        "x-dead-letter-exchange":    "dlx",
-        "x-dead-letter-routing-key": q + ".dlq",
-        "x-message-ttl":             int32(86_400_000),
-    }
-    if _, err := ch.QueueDeclare(q, true, false, false, false, args); err != nil {
-        return nil, fmt.Errorf("declare queue %s: %w", err)
-    }
-}
-```
-
-> **Note**: Queue arguments are immutable after creation. If the queues already exist without DLX args, you must delete and re-declare them (this requires a brief maintenance window or a new queue name strategy).
-
-#### Step 2 — NACK instead of ACK on processing failures
-
-In `internal/worker/worker.go`, change the error path from `d.Ack` to `d.Nack` so the broker routes the message to the DLQ:
-
-```go
-// Before (message lost)
-if err := w.process(ctx, &req); err != nil {
-    // publish error reply, then...
-    d.Ack(false)
-}
-
-// After (message routed to DLQ)
-if err := w.process(ctx, &req); err != nil {
-    // publish error reply for the caller, and...
-    d.Nack(false, false) // requeue=false → triggers DLX routing
-    continue
-}
-d.Ack(false)
-```
-
-Apply the same pattern in file-service's `result_consumer.go`.
-
-#### Step 3 — Retry worker (optional)
-
-Add a separate goroutine (or a new service) that consumes from `file.analyze.dlq`, waits for a backoff period, and republishes messages to `file.analyze`:
-
-```go
-func retryDLQ(ctx context.Context, broker messaging.Consumer, delay time.Duration) {
-    msgs, _ := broker.Consume(ctx, "file.analyze.dlq")
-    for d := range msgs {
-        select {
-        case <-ctx.Done():
-            return
-        case <-time.After(delay):
-            broker.Publish(ctx, "", "file.analyze", d.Body)
-            d.Ack(false)
-        }
-    }
-}
-```
-
-#### Step 4 — Monitor the DLQs
-
-Use the RabbitMQ Management UI at `http://localhost:15672` (guest/guest) to watch `file.analyze.dlq` and `file.analysis.result.dlq` for accumulated messages. Alert when queue depth exceeds a threshold.
-
-### Summary of queue topology after DLX
-
-```
-file.analyze  ──(nack/ttl)──▶  dlx exchange  ──▶  file.analyze.dlq
-file.analysis.result  ────────▶  dlx exchange  ──▶  file.analysis.result.dlq
-```
 
 ## Dependencies
 

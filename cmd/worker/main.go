@@ -64,7 +64,7 @@ func run() error {
 	go w.Run(workerCtx)
 
 	// --- Health server ------------------------------------------------------
-	e := server.New()
+	e := server.New(store, server.PingFunc(broker.Ping))
 	go func() {
 		addr := ":" + cfg.ServerPort
 		log.Printf("health server on %s\n", addr)

@@ -54,45 +54,51 @@ func (w *Worker) Run(ctx context.Context) {
 		}
 
 		log.Println("worker: listening on file.analyze")
-		for body := range msgs {
-			w.handle(ctx, body)
+		for del := range msgs {
+			w.handle(ctx, del)
 		}
 		log.Println("worker: message channel closed, reconnecting…")
 	}
 }
 
-func (w *Worker) handle(ctx context.Context, body []byte) {
+func (w *Worker) handle(ctx context.Context, del messaging.Delivery) {
 	var req translation.AnalyzeRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		log.Printf("worker: unmarshal request: %v", err)
+	if err := json.Unmarshal(del.Body, &req); err != nil {
+		log.Printf("worker: unmarshal request: %v — nacking to DLQ", err)
+		del.Nack()
 		return
 	}
 
 	log.Printf("worker: processing file %d object_key=%s", req.FileID, req.ObjectKey)
 
-	reply := translation.AnalysisReply{
-		FileID:        req.FileID,
-		CorrelationID: req.CorrelationID,
-	}
-
 	summary, err := w.process(ctx, req)
 	if err != nil {
-		log.Printf("worker: process file %d: %v", req.FileID, err)
-		reply.Error = err.Error()
-	} else {
-		reply.TranslationSummary = summary
-		log.Printf("worker: published translation result for file %d", req.FileID)
+		log.Printf("worker: process file %d: %v — nacking to DLQ", req.FileID, err)
+		del.Nack()
+		return
+	}
+
+	reply := translation.AnalysisReply{
+		FileID:             req.FileID,
+		CorrelationID:      req.CorrelationID,
+		TranslationSummary: summary,
 	}
 
 	replyBody, err := json.Marshal(reply)
 	if err != nil {
-		log.Printf("worker: marshal reply for file %d: %v", req.FileID, err)
+		log.Printf("worker: marshal reply for file %d: %v — nacking to DLQ", req.FileID, err)
+		del.Nack()
 		return
 	}
 
 	if err := w.broker.Publish(ctx, "", "file.analysis.result", replyBody); err != nil {
-		log.Printf("worker: publish reply for file %d: %v", req.FileID, err)
+		log.Printf("worker: publish reply for file %d: %v — nacking to DLQ", req.FileID, err)
+		del.Nack()
+		return
 	}
+
+	del.Ack()
+	log.Printf("worker: published translation result for file %d", req.FileID)
 }
 
 func (w *Worker) process(ctx context.Context, req translation.AnalyzeRequest) (string, error) {

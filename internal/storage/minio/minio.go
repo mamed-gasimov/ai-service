@@ -61,6 +61,15 @@ func (c *Client) Download(ctx context.Context, objectKey string) (io.ReadCloser,
 	return obj, nil
 }
 
+// Ping verifies that MinIO is reachable by checking the bucket exists.
+func (c *Client) Ping(ctx context.Context) error {
+	_, err := c.client.BucketExists(ctx, c.bucket)
+	if err != nil {
+		return fmt.Errorf("minio ping: %w", err)
+	}
+	return nil
+}
+
 func (c *Client) Delete(ctx context.Context, objectKey string) error {
 	err := c.client.RemoveObject(ctx, c.bucket, objectKey, minio.RemoveObjectOptions{})
 	if err != nil {
